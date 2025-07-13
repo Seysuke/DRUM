@@ -1,0 +1,100 @@
+#include <XInput.h>
+
+// ------- CONFIGURACIÓN DE PINES Y BOTONES -------
+#define NUM_PIEZOS 4
+const int piezoPins[NUM_PIEZOS]   = {A0, A1, A2, A3};  // Pines analógicos conectados a los piezos
+const uint8_t piezoBtns[NUM_PIEZOS] = {BUTTON_X, BUTTON_Y, BUTTON_A, BUTTON_B}; // Botones a simular
+
+// ------- AJUSTES DE DETECCIÓN -------
+const int THRESHOLD     = 50;   // Umbral mínimo para considerar un golpe válido
+const int DELTA_MIN     = 15;   // Cambio mínimo entre lecturas para filtrar golpes reales
+const int COOL_TIME     = 120;  // Tiempo (ms) de bloqueo entre golpes para evitar dobles/crosstalk
+const int RELEASE_TIME  = 60;   // Tiempo (ms) que permanece "presionado" el botón virtual
+const int MEDIA_MOVIL   = 5;    // Tamaño del filtro de media móvil (entre 6 y 12)
+
+// ------- VARIABLES DE FILTRO Y ESTADO -------
+int valores[NUM_PIEZOS][MEDIA_MOVIL] = {0};  // Buffer para filtro de media móvil por canal
+int indices[NUM_PIEZOS] = {0};               // Índice actual para el buffer circular de cada canal
+int lecturaPrev[NUM_PIEZOS] = {0};           // Última lectura de cada canal, para calcular delta
+unsigned long oldTime[NUM_PIEZOS] = {0};     // Última vez que se presionó cada botón
+unsigned long lastHitGlobal = 0;             // Última vez que cualquier golpe fue detectado (para ventana muerta global)
+bool presionado[NUM_PIEZOS] = {false};       // Estado actual de cada botón (presionado/no presionado)
+
+// ------- SETUP -------
+void setup() {
+  analogReference(INTERNAL); // Usar referencia interna (más estable para piezos en Leonardo)
+  for (int i = 0; i < NUM_PIEZOS; i++) {
+    pinMode(piezoPins[i], INPUT); // Definir cada piezo como entrada analógica
+  }
+  pinMode(LED_BUILTIN, OUTPUT); // LED integrado para feedback visual
+
+  // --------- ESPERA DE INICIO ---------
+  // Da tiempo para que el USB se inicialice como control antes de comenzar (3 seg o hasta detectar golpe)
+  unsigned long startTime = millis();
+  while (millis() - startTime < 3000) {
+    if (anyPiezoAboveThreshold()) break; // Si golpeas un tambor, inicia antes
+    digitalWrite(LED_BUILTIN, (millis() / 500) % 2); // LED parpadea durante la espera
+    delay(10);
+  }
+  digitalWrite(LED_BUILTIN, LOW);
+
+  XInput.begin(); // Inicializa la librería XInput (¡Ahora el Leonardo se registra como gamepad!)
+}
+
+// ------- LOOP PRINCIPAL -------
+void loop() {
+  unsigned long now = millis();
+  int maxVal = 0, maxIdx = -1;
+
+  // ------ 1. LEE CADA PIEZO Y DETECTA EL GOLPE MÁS FUERTE ------
+  for (int i = 0; i < NUM_PIEZOS; i++) {
+    int v = filtroMediaMovilPorPin(piezoPins[i], valores[i], &indices[i]); // Lectura filtrada del piezo
+    int delta = v - lecturaPrev[i]; // Cambio desde la última lectura
+    lecturaPrev[i] = v; // Guarda valor para el próximo ciclo
+
+    // Verifica si es un golpe válido: supera umbral, delta suficiente y fuera de ventana muerta global
+    if (v > THRESHOLD && delta > DELTA_MIN && (now - lastHitGlobal > COOL_TIME)) {
+      if (v > maxVal) { // Si este golpe es el más fuerte en este ciclo, guárdalo
+        maxVal = v;
+        maxIdx = i;
+      }
+    }
+  }
+
+  // ------ 2. SOLO SE REGISTRA EL GOLPE MÁS FUERTE (Y SOLO SI NO ESTÁ YA PRESIONADO) ------
+  if (maxIdx != -1 && !presionado[maxIdx]) {
+    lastHitGlobal = now; // Actualiza la ventana muerta global
+    XInput.press(piezoBtns[maxIdx]); // Presiona el botón correspondiente en XInput (gamepad)
+    presionado[maxIdx] = true;       // Marca este botón como presionado
+    oldTime[maxIdx] = now;           // Guarda el momento para liberar después
+    digitalWrite(LED_BUILTIN, HIGH); // Enciende el LED (feedback visual)
+  }
+
+  // ------ 3. LIBERA BOTONES DESPUÉS DE RELEASE_TIME ------
+  for (int i = 0; i < NUM_PIEZOS; i++) {
+    if (presionado[i] && (now - oldTime[i]) > RELEASE_TIME) {
+      XInput.release(piezoBtns[i]);  // Libera el botón virtual en XInput
+      presionado[i] = false;         // Marca como no presionado
+      digitalWrite(LED_BUILTIN, LOW);// Apaga el LED (opcional)
+    }
+  }
+
+  XInput.send(); // Envía todos los cambios al PC/juego (importante para actualización rápida)
+}
+
+// ------- FILTRO DE MEDIA MÓVIL (para estabilizar lecturas analógicas) -------
+int filtroMediaMovilPorPin(int pin, int* vals, int* idx) {
+  int suma = 0;
+  vals[*idx] = analogRead(pin);        // Lee el valor actual y lo guarda en el buffer
+  *idx = (*idx + 1) % MEDIA_MOVIL;     // Avanza el índice (circular)
+  for (int i = 0; i < MEDIA_MOVIL; i++) suma += vals[i];
+  return suma / MEDIA_MOVIL;           // Retorna el promedio (media móvil)
+}
+
+// ------- FUNCIÓN: ¿ALGÚN PIEZO SUPERA EL UMBRAL? (Para la espera de inicio) -------
+bool anyPiezoAboveThreshold() {
+  for (int i = 0; i < NUM_PIEZOS; i++) {
+    if (analogRead(piezoPins[i]) > THRESHOLD) return true;
+  }
+  return false;
+}
