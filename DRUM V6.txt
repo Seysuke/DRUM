@@ -1,0 +1,102 @@
+#include <XInput.h>
+
+// ------- PIN AND BUTTON CONFIGURATION -------
+#define NUM_PIEZOS 4
+const int piezoPins[NUM_PIEZOS]     = {A0, A1, A2, A3};                // Analog pins connected to piezo modules
+const uint8_t piezoBtns[NUM_PIEZOS] = {BUTTON_X, BUTTON_Y, BUTTON_A, BUTTON_B}; // XInput buttons to simulate
+
+// ------- SIGNAL DETECTION SETTINGS -------
+const int THRESHOLD     = 50;   // Minimum threshold to detect a valid hit
+const int DELTA_MIN     = 15;   // Minimum change between readings to validate a real impact
+const int COOL_TIME     = 120;  // Global cooldown in milliseconds between hits to avoid double or crosstalk
+const int RELEASE_TIME  = 60;   // Time the virtual button stays pressed before being released (ms)
+const int MEDIA_MOVIL   = 5;    // Size of moving average filter (recommended between 6–12)
+
+// ------- FILTER AND STATE VARIABLES -------
+int valores[NUM_PIEZOS][MEDIA_MOVIL] = {0};  // Moving average buffer for each channel
+int indices[NUM_PIEZOS] = {0};               // Circular index for each buffer
+int lecturaPrev[NUM_PIEZOS] = {0};           // Previous reading per channel for delta calculation
+unsigned long oldTime[NUM_PIEZOS] = {0};     // Last time each button was pressed
+unsigned long lastHitGlobal = 0;             // Last time any hit was detected (for global cooldown)
+bool presionado[NUM_PIEZOS] = {false};       // Current state of each button (pressed or not)
+
+// ------- SETUP -------
+void setup() {
+  analogReference(INTERNAL); // Use internal voltage reference (more stable for piezo readings on Leonardo)
+
+  for (int i = 0; i < NUM_PIEZOS; i++) {
+    pinMode(piezoPins[i], INPUT); // Set each piezo pin as analog input
+  }
+
+  pinMode(LED_BUILTIN, OUTPUT); // Built-in LED for visual feedback
+
+  // --------- STARTUP WAIT PERIOD ---------
+  // Give time for USB enumeration or allow early start by hitting a sensor
+  unsigned long startTime = millis();
+  while (millis() - startTime < 3000) {
+    if (anyPiezoAboveThreshold()) break; // If a drum is hit, skip wait
+    digitalWrite(LED_BUILTIN, (millis() / 500) % 2); // Blink LED while waiting
+    delay(10);
+  }
+  digitalWrite(LED_BUILTIN, LOW);
+
+  XInput.begin(); // Start XInput — Arduino Leonardo will now act as a gamepad
+}
+
+// ------- MAIN LOOP -------
+void loop() {
+  unsigned long now = millis();
+  int maxVal = 0, maxIdx = -1;
+
+  // ------ 1. READ PIEZO INPUTS AND DETECT THE STRONGEST VALID HIT ------
+  for (int i = 0; i < NUM_PIEZOS; i++) {
+    int v = filtroMediaMovilPorPin(piezoPins[i], valores[i], &indices[i]); // Filtered analog reading
+    int delta = v - lecturaPrev[i];   // Difference from last reading
+    lecturaPrev[i] = v;               // Store current value
+
+    // Check for valid hit: above threshold, strong delta, and outside global cooldown
+    if (v > THRESHOLD && delta > DELTA_MIN && (now - lastHitGlobal > COOL_TIME)) {
+      if (v > maxVal) { // Track the strongest hit in this loop iteration
+        maxVal = v;
+        maxIdx = i;
+      }
+    }
+  }
+
+  // ------ 2. REGISTER ONLY THE STRONGEST HIT (IF BUTTON NOT ALREADY PRESSED) ------
+  if (maxIdx != -1 && !presionado[maxIdx]) {
+    lastHitGlobal = now; // Update global cooldown
+    XInput.press(piezoBtns[maxIdx]); // Press the corresponding virtual button
+    presionado[maxIdx] = true;       // Mark button as pressed
+    oldTime[maxIdx] = now;           // Save time to manage release later
+    digitalWrite(LED_BUILTIN, HIGH); // Turn on LED as feedback
+  }
+
+  // ------ 3. RELEASE BUTTONS AFTER RELEASE_TIME ------
+  for (int i = 0; i < NUM_PIEZOS; i++) {
+    if (presionado[i] && (now - oldTime[i]) > RELEASE_TIME) {
+      XInput.release(piezoBtns[i]);  // Release virtual button
+      presionado[i] = false;         // Mark as not pressed
+      digitalWrite(LED_BUILTIN, LOW); // Turn off LED (optional)
+    }
+  }
+
+  XInput.send(); // Send all button state updates to the PC/game
+}
+
+// ------- MOVING AVERAGE FILTER FUNCTION (stabilizes analog readings) -------
+int filtroMediaMovilPorPin(int pin, int* vals, int* idx) {
+  int suma = 0;
+  vals[*idx] = analogRead(pin);         // Read current value and store in circular buffer
+  *idx = (*idx + 1) % MEDIA_MOVIL;      // Increment index (wrap around)
+  for (int i = 0; i < MEDIA_MOVIL; i++) suma += vals[i];
+  return suma / MEDIA_MOVIL;            // Return average
+}
+
+// ------- UTILITY: CHECK IF ANY PIEZO IS ABOVE THRESHOLD (used for early startup) -------
+bool anyPiezoAboveThreshold() {
+  for (int i = 0; i < NUM_PIEZOS; i++) {
+    if (analogRead(piezoPins[i]) > THRESHOLD) return true;
+  }
+  return false;
+}
